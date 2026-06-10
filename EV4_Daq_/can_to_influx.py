@@ -108,16 +108,31 @@ def setup_bus() -> can.BusABC:
         sys.exit(1)
 
 
+# Running totals of what has actually been confirmed written to InfluxDB
+# (updated by the batching write callbacks on a background thread).
+upload_stats = {"points": 0, "batches": 0, "errors": 0}
+
+
+def _count_points(data) -> int:
+    """Number of line-protocol points in a flushed batch payload."""
+    text = data.decode() if isinstance(data, (bytes, bytearray)) else data
+    return len(text.splitlines())
+
+
 # Batching write callbacks. With the batching write API, writes are queued and
 # flushed on a background thread, so success/failure is reported here (errors
-# from a bad token/database/network show up via error_cb a few seconds after
-# the first write).
+# from a bad token/database/network show up a second or two after the first write).
 def _success_cb(conf, data):
-    logger.debug("InfluxDB batch write OK (%d bytes).", len(data))
+    n = _count_points(data)
+    upload_stats["points"] += n
+    upload_stats["batches"] += 1
+    logger.info("InfluxDB <- uploaded %d points (%d total).", n, upload_stats["points"])
 
 
 def _error_cb(conf, data, exception):
-    logger.error("InfluxDB write failed: %s", exception)
+    upload_stats["errors"] += 1
+    logger.error("InfluxDB write FAILED (%d points dropped): %s",
+                 _count_points(data), exception)
 
 
 def _retry_cb(conf, data, exception):
@@ -131,9 +146,9 @@ def make_influx_client() -> InfluxDBClient3:
         sys.exit(1)
 
     write_options = WriteOptions(
-        batch_size=500,
-        flush_interval=2_000,    # ms
-        jitter_interval=500,
+        batch_size=200,          # flush once 200 points pile up...
+        flush_interval=1_000,    # ...or every 1 s, whichever comes first (ms)
+        jitter_interval=200,
         retry_interval=5_000,
         max_retries=5,
         max_retry_delay=30_000,
@@ -156,7 +171,8 @@ def make_influx_client() -> InfluxDBClient3:
     )
     logger.info("InfluxDB v3 client ready -> database '%s' on %s",
                 INFLUX_DATABASE, INFLUX_HOST)
-    logger.info("(Write errors, if any, appear a few seconds after the first message.)")
+    logger.info("Batching: flush every 1 s or 200 points. You'll see "
+                "'InfluxDB <- uploaded N points' lines once data flows.")
     return client
 
 
@@ -250,8 +266,8 @@ def main():
                     if point is not None:
                         client.write(record=point)
                         decoded_count += 1
-                        if decoded_count % 500 == 0:
-                            logger.info("Queued %d decoded messages so far...", decoded_count)
+                        # Upload confirmation is logged by _success_cb in real
+                        # time as each batch flushes (every 1 s / 200 points).
 
     except Exception as e:
         logger.error("Fatal error in main loop: %s", e)
@@ -262,8 +278,12 @@ def main():
         except Exception as e:
             logger.error("Error closing InfluxDB client: %s", e)
         bus.shutdown()
-        logger.info("Done. %d messages queued for upload. Unknown IDs seen: %d.",
-                    decoded_count, len(unknown_ids))
+        logger.info(
+            "Done. Decoded %d msgs | uploaded %d points in %d batches | "
+            "write errors: %d | unknown IDs seen: %d.",
+            decoded_count, upload_stats["points"], upload_stats["batches"],
+            upload_stats["errors"], len(unknown_ids),
+        )
 
 
 if __name__ == "__main__":
