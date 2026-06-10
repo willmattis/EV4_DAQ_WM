@@ -15,9 +15,11 @@ Stop with Ctrl+C.
 import os
 import sys
 import csv
+import time
 import signal
 import logging
 import platform
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -57,12 +59,20 @@ logging.basicConfig(
 logger = logging.getLogger("ev4_daq")
 
 running = True
+_sigint_count = 0
 
 
 def signal_handler(signum, frame):
-    global running
-    logger.info("Shutdown signal received, stopping...")
-    running = False
+    global running, _sigint_count
+    _sigint_count += 1
+    if _sigint_count == 1:
+        logger.info("Shutdown signal received, stopping (flushing backlog -- "
+                    "press Ctrl+C again to force-quit immediately)...")
+        running = False
+    else:
+        logger.warning("Second Ctrl+C -- force quitting. Unflushed points remain "
+                       "in the CSV backup.")
+        os._exit(1)
 
 
 def load_dbc() -> cantools.database.Database:
@@ -117,6 +127,15 @@ def _count_points(data) -> int:
     """Number of line-protocol points in a flushed batch payload."""
     text = data.decode() if isinstance(data, (bytes, bytearray)) else data
     return len(text.splitlines())
+
+
+def _safe_close(client):
+    """Close the client (flushes queued batches). Run on a worker thread so a
+    slow network can be bounded by a join timeout in the caller."""
+    try:
+        client.close()
+    except Exception as e:
+        logger.error("Error during InfluxDB flush/close: %s", e)
 
 
 # Batching write callbacks. With the batching write API, writes are queued and
@@ -220,6 +239,7 @@ def main():
 
     decoded_count = 0
     unknown_ids = set()
+    last_stats = time.monotonic()
 
     try:
         with open(csv_path, "w", newline="") as f:
@@ -230,6 +250,17 @@ def main():
             )
 
             while running:
+                # Every 5 s, print decoded vs uploaded vs backlog. A backlog that
+                # keeps growing means the network can't keep up with the data rate
+                # (network problem); a flat/zero backlog means uploads keep pace.
+                now = time.monotonic()
+                if now - last_stats >= 5.0:
+                    backlog = decoded_count - upload_stats["points"]
+                    logger.info("STATS decoded=%d uploaded=%d backlog=%d errors=%d",
+                                decoded_count, upload_stats["points"],
+                                backlog, upload_stats["errors"])
+                    last_stats = now
+
                 msg = bus.recv(timeout=1.0)
                 if msg is None:
                     continue
@@ -272,11 +303,17 @@ def main():
     except Exception as e:
         logger.error("Fatal error in main loop: %s", e)
     finally:
-        logger.info("Flushing remaining InfluxDB writes...")
-        try:
-            client.close()  # flushes any queued batches
-        except Exception as e:
-            logger.error("Error closing InfluxDB client: %s", e)
+        backlog = decoded_count - upload_stats["points"]
+        logger.info("Flushing remaining InfluxDB writes (backlog ~%d points)...", backlog)
+        # Flush on a background thread so a slow/dead network can't hang shutdown
+        # forever. Everything is already safe in the CSV, so a timeout is OK.
+        closer = threading.Thread(target=_safe_close, args=(client,), daemon=True)
+        closer.start()
+        closer.join(timeout=float(os.getenv("FLUSH_TIMEOUT", "15")))
+        if closer.is_alive():
+            logger.warning("Flush didn't finish in time over this network. "
+                           "Exiting anyway -- the CSV backup has every frame; "
+                           "you can back-fill InfluxDB from it later.")
         bus.shutdown()
         logger.info(
             "Done. Decoded %d msgs | uploaded %d points in %d batches | "
