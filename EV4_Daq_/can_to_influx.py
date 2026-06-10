@@ -49,6 +49,43 @@ LOG_DIR = Path(os.getenv("LOG_DIR", "can_logs"))
 SESSION_TAG = os.getenv("SESSION_TAG", "")
 
 # ---------------------------------------------------------------------------
+# Live-upload policy (for weak/cellular links)
+# ---------------------------------------------------------------------------
+# The CAN bus produces far more data than a hotspot can stream (the inverter
+# messages alone flood the link). The CSV backup always captures EVERY frame at
+# full rate, so nothing is ever lost -- this policy only controls what gets
+# uploaded to InfluxDB *live*. Run backfill_csv.py later to push the full CSV
+# over a good connection.
+#
+# Each entry is: measurement name -> max live upload rate in Hz.
+#   value > 0   : cap to that many uploads/second (downsample)
+#   value <= 0  : drop from live entirely (CSV-only)
+# Anything not listed uses LIVE_DEFAULT_HZ. Default is 0, so by default only the
+# messages listed here go up live -- an allowlist, ordered by your priorities.
+LIVE_DEFAULT_HZ = float(os.getenv("LIVE_DEFAULT_HZ", "0"))
+LIVE_RATES_HZ = {
+    "ECU_FAULTS":       1000.0,   # 1) faults: critical, low-rate -> every frame
+    "BMS_Info":           10.0,   # 2) pack SOC / current / temps
+    "APPS_Info":          15.0,   # 3) pedal & torque command
+    "Internal_States":    10.0,   # 4) power draw, R2D, drive mode
+    "Sensors_Info":        5.0,   # 5) brake pressure, water temps
+}
+
+# Tracks the last live-upload time per measurement, for rate limiting.
+_last_live: dict[str, float] = {}
+
+
+def allow_live(name: str, now: float) -> bool:
+    """Rate-limit/allowlist gate for live upload. CSV logging is unaffected."""
+    hz = LIVE_RATES_HZ.get(name, LIVE_DEFAULT_HZ)
+    if hz <= 0:
+        return False
+    if now - _last_live.get(name, 0.0) >= 1.0 / hz:
+        _last_live[name] = now
+        return True
+    return False
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -165,8 +202,8 @@ def make_influx_client() -> InfluxDBClient3:
         sys.exit(1)
 
     write_options = WriteOptions(
-        batch_size=200,          # flush once 200 points pile up...
-        flush_interval=1_000,    # ...or every 1 s, whichever comes first (ms)
+        batch_size=5_000,        # large batches amortize the per-request latency
+        flush_interval=2_000,    # ...flushed at least every 2 s (ms)
         jitter_interval=200,
         retry_interval=5_000,
         max_retries=5,
@@ -187,6 +224,7 @@ def make_influx_client() -> InfluxDBClient3:
         org=INFLUX_ORG,
         database=INFLUX_DATABASE,
         write_client_options=wco,
+        enable_gzip=True,        # compress line protocol (~5-10x) for slow links
     )
     logger.info("InfluxDB v3 client ready -> database '%s' on %s",
                 INFLUX_DATABASE, INFLUX_HOST)
@@ -237,7 +275,8 @@ def main():
     csv_path = LOG_DIR / f"can_{stamp}.csv"
     logger.info("CSV backup: %s", csv_path)
 
-    decoded_count = 0
+    decoded_count = 0   # all messages decoded (all of which go to the CSV)
+    queued_count = 0    # subset actually sent to InfluxDB live (after the policy)
     unknown_ids = set()
     last_stats = time.monotonic()
 
@@ -255,10 +294,16 @@ def main():
                 # (network problem); a flat/zero backlog means uploads keep pace.
                 now = time.monotonic()
                 if now - last_stats >= 5.0:
-                    backlog = decoded_count - upload_stats["points"]
-                    logger.info("STATS decoded=%d uploaded=%d backlog=%d errors=%d",
-                                decoded_count, upload_stats["points"],
-                                backlog, upload_stats["errors"])
+                    # backlog = queued-for-live minus confirmed-uploaded. If it
+                    # keeps growing, the link still can't keep up even after the
+                    # downsample policy -> tighten LIVE_RATES_HZ. decoded>>queued
+                    # is expected and fine (the rest is CSV-only / back-filled).
+                    backlog = queued_count - upload_stats["points"]
+                    logger.info(
+                        "STATS decoded=%d queued_live=%d uploaded=%d backlog=%d errors=%d",
+                        decoded_count, queued_count, upload_stats["points"],
+                        backlog, upload_stats["errors"],
+                    )
                     last_stats = now
 
                 msg = bus.recv(timeout=1.0)
@@ -293,17 +338,22 @@ def main():
                 f.flush()
 
                 if message and decoded:
-                    point = build_point(message, decoded, msg.arbitration_id, ts_unix)
-                    if point is not None:
-                        client.write(record=point)
-                        decoded_count += 1
-                        # Upload confirmation is logged by _success_cb in real
-                        # time as each batch flushes (every 1 s / 200 points).
+                    decoded_count += 1
+                    # Live-upload policy: only the prioritized messages, rate-
+                    # limited, go up live. Everything else is CSV-only and gets
+                    # back-filled later. (CSV write above already captured it.)
+                    if allow_live(msg_name, now):
+                        point = build_point(message, decoded, msg.arbitration_id, ts_unix)
+                        if point is not None:
+                            client.write(record=point)
+                            queued_count += 1
+                            # Upload confirmation is logged by _success_cb in real
+                            # time as each batch flushes.
 
     except Exception as e:
         logger.error("Fatal error in main loop: %s", e)
     finally:
-        backlog = decoded_count - upload_stats["points"]
+        backlog = queued_count - upload_stats["points"]
         logger.info("Flushing remaining InfluxDB writes (backlog ~%d points)...", backlog)
         # Flush on a background thread so a slow/dead network can't hang shutdown
         # forever. Everything is already safe in the CSV, so a timeout is OK.
@@ -316,11 +366,14 @@ def main():
                            "you can back-fill InfluxDB from it later.")
         bus.shutdown()
         logger.info(
-            "Done. Decoded %d msgs | uploaded %d points in %d batches | "
-            "write errors: %d | unknown IDs seen: %d.",
-            decoded_count, upload_stats["points"], upload_stats["batches"],
-            upload_stats["errors"], len(unknown_ids),
+            "Done. Decoded %d msgs (all in CSV) | queued %d live | uploaded %d "
+            "in %d batches | write errors: %d | unknown IDs: %d.",
+            decoded_count, queued_count, upload_stats["points"],
+            upload_stats["batches"], upload_stats["errors"], len(unknown_ids),
         )
+        logger.info("Full-resolution data is in %s -- run "
+                    "'python3 backfill_csv.py %s' over a good connection to upload it all.",
+                    csv_path, csv_path)
 
 
 if __name__ == "__main__":
